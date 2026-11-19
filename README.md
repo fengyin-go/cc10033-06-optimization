@@ -79,5 +79,36 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 变更履历导出
+
+变更日志（`slow_change_log`）的导出按**业务生效日期 + 变更ID**生成履历文件，
+每次导出一个批次，批次在创建时冻结当次的**日志截止点**（截取边界）。
+
+```text
+POST /api/slow_change_log/exports?from=2026-09-01&to=2026-09-30&change_id=&dim=&page_size=20
+GET  /api/slow_change_log/exports/{export_id}/pages/{page}     分页取数（顺序固定）
+GET  /api/slow_change_log/exports/{export_id}/resume           断线续做，给出未取回页码
+POST /api/slow_change_log/exports/{export_id}/complete         收口交付并登记台账
+GET  /api/slow_change_log/exports                              交付台账
+GET  /api/slow_change_log/exports/{export_id}/file             下载交付文件
+GET  /api/slow_change_log/exports/{export_id}/verify           按生成时的边界复核
+GET  /api/slow_change_log/processing-records                   SCD 策略启停与失败处理记录
+GET  /api/slow_change_log/export?...                           一次性交付（同样带边界并登记台账）
+```
+
+规则：
+
+- 同一个变更ID 只占一行；同一变更下多个属性的前值/后值合并展示。
+- 跨页顺序固定为「生效日期升序，其次变更ID升序」。
+- 边界按**日志序号**而不是墙上时钟冻结：下载中途补录的变更即使生效日期
+  落在原查询月份内，也会因序号更大而被已创建的批次排除。
+- 交付文件首部写明 `#日志截止点`，所有行都落在该边界内；`verify` 会比对
+  截止点、区间、行数、摘要，并按边界回放源日志核对行集合与顺序。
+- SCD 处理落库时写入属性前值、后值、生效日期与日志序号；策略启停、无效
+  生效时间、后续处理失败都会写入处理记录（内部表不进入业务模块列表）。
+
+前端入口：变更日志页面右上角「变更履历导出」，对应
+`frontend/src/views/ChangeExportView.vue`（路径 `/slow_change_log/export-workbench`）。
+
 领域：数据工程
 子方向：数仓与数据湖

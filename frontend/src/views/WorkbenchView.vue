@@ -12,6 +12,14 @@
         <button class="btn" data-testid="export" type="button" @click="exportRows">
           导出{{ meta.name }}清单
         </button>
+        <RouterLink
+          v-if="meta.key === 'slow_change_log'"
+          class="btn"
+          data-testid="open-change-export"
+          to="/slow_change_log/export-workbench"
+        >
+          变更履历导出
+        </RouterLink>
       </div>
     </header>
 

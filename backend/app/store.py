@@ -12,6 +12,26 @@ from typing import Any
 
 from app.seed import SEED_ROWS
 
+_CHANGE_DATE_FIELDS = ("生效日期", "变更时间")
+
+
+def _effective_date_from(row: dict[str, Any]) -> str:
+    """取变更记录的业务生效日期，缺失时退回变更时间的前 10 位。"""
+    for field in _CHANGE_DATE_FIELDS:
+        raw = str(row.get(field) or "").strip()
+        if raw:
+            return raw[:10]
+    return ""
+
+
+def _record_time_from(row: dict[str, Any]) -> str:
+    """取变更记录的登记时间，缺失时用变更日期补一个零点时间戳。"""
+    raw = str(row.get("变更时间") or "").strip()
+    if len(raw) > 10:
+        return raw
+    date_part = _effective_date_from(row)
+    return f"{date_part}T00:00:00+00:00" if date_part else datetime.now(timezone.utc).isoformat()
+
 
 class DataChannel:
     """跨模块数据通道：上游模块发布数据产物，下游模块通过 topic 消费。"""
@@ -321,16 +341,54 @@ class Store:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        # 内部处理记录不参与业务模块枚举，避免出现在通用资源路由和运营概览里。
+        self._tables.setdefault("_scd_processing_record", [])
         self.channel = DataChannel()
         self.recovery = FailureRecovery()
         self.snapshot = SnapshotEngine()
         self.artifacts = ArtifactRegistry()
+        self._change_log_seq = 0
+        self.ensure_change_log_sequence()
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        return sorted(name for name in self._tables if not name.startswith("_"))
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
+
+    def ensure_change_log_sequence(self) -> int:
+        """为变更日志补齐单调递增的日志序号和记录时间。
+
+        导出截取边界使用日志序号而不是墙上时钟：后补录的历史变更即使
+        生效日期落在原查询月份内，也会拿到更大的序号而被旧边界排除。
+        """
+        rows = self.rows("slow_change_log")
+        existing_max = max((int(row.get("日志序号") or 0) for row in rows), default=0)
+        self._change_log_seq = max(self._change_log_seq, existing_max)
+        for row in rows:
+            if not row.get("日志序号"):
+                self._change_log_seq += 1
+                row["日志序号"] = self._change_log_seq
+            if not row.get("记录时间"):
+                row["记录时间"] = _record_time_from(row)
+            if not row.get("生效日期"):
+                row["生效日期"] = _effective_date_from(row)
+        return self._change_log_seq
+
+    def next_change_log_seq(self) -> int:
+        self._change_log_seq += 1
+        return self._change_log_seq
+
+    def append_change_log(self, row: dict[str, Any]) -> dict[str, Any]:
+        """追加一条变更日志：统一分配 id、日志序号和记录时间。"""
+        rows = self.rows("slow_change_log")
+        if not row.get("id"):
+            row["id"] = max((int(item.get("id") or 0) for item in rows), default=0) + 1
+        row.setdefault("记录时间", datetime.now(timezone.utc).isoformat())
+        row.setdefault("生效日期", _effective_date_from(row))
+        rows.append(row)
+        self.ensure_change_log_sequence()
+        return row
 
     def find(self, module: str, entry_id: int) -> dict[str, Any] | None:
         for row in self.rows(module):

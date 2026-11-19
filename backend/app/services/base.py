@@ -1,9 +1,29 @@
 """模块服务基类：共享查询、登记、动作和统计骨架，业务差异留在各模块文件。"""
 from __future__ import annotations
 
+import csv
+import io
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.store import store
+
+
+@dataclass
+class ExportFile:
+    """导出结果：文件内容、下载名和建议的响应头。"""
+
+    content: str
+    filename: str
+    media_type: str = "text/csv; charset=utf-8"
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+def csv_safe(value: Any) -> Any:
+    """防止导出的文本被表格软件当作公式执行。"""
+    if str(value or "").startswith(("=", "+", "-", "@")):
+        return "'" + str(value)
+    return value
 
 
 class BaseModuleService:
@@ -70,6 +90,40 @@ class BaseModuleService:
         entry["pending"] = target != self.STATUS_ORDER[-1]
         entry["abnormal"] = action in self.NEGATIVE_ACTIONS
         return entry, f"{self.ENTITY}已{action}"
+
+    def export_entries(
+        self,
+        *,
+        filters: dict[str, str] | None = None,
+        keyword: str | None = None,
+        status: str | None = None,
+        params: dict[str, str] | None = None,
+    ) -> ExportFile:
+        """通用清单导出：按列表条件输出当前全部行，保持原有行为。"""
+        items, _ = self.list_entries(
+            filters=filters, keyword=keyword, status=status, page=1, size=1_000_000)
+        output = io.StringIO()
+        output.write("﻿")
+        writer = csv.writer(output, lineterminator="\n")
+        writer.writerow(["id", *self.LIST_FIELDS, "status"])
+        for item in items:
+            values = [item.get("id"), *(item.get(field, "") for field in self.LIST_FIELDS),
+                      item.get("status", "")]
+            writer.writerow([csv_safe(value) for value in values])
+        return ExportFile(content=output.getvalue(), filename=f"{self.MODULE}.csv")
+
+    def list_exports(self) -> list[dict[str, Any]]:
+        """模块未提供导出交付台账时返回空列表。"""
+        return []
+
+    def get_export(self, export_id: str) -> dict[str, Any] | None:
+        return None
+
+    def get_export_file(self, export_id: str) -> ExportFile | None:
+        return None
+
+    def list_processing_records(self) -> list[dict[str, Any]]:
+        return []
 
     def domain_snapshot(self) -> dict[str, Any]:
         """输出模块级数据质量快照，供跨模块消费和题位源码锚点使用。"""

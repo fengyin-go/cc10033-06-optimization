@@ -6,14 +6,17 @@
 - SCD类型3：保留原值和新值两列，支持当前值与上一值并存
 - 消费 dim.defined 和 attr.confirmed 通道消息
 - 变化检测基于MD5哈希，自动生成suggested策略
+- 处理落库时把属性前值/后值/生效日期写入变更日志，供导出接口提取业务履历
+- 策略启停与后续处理失败写入处理记录
 """
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.slow_change_log import record_dimension_changes, record_processing
 from app.store import store
 
 
@@ -93,35 +96,79 @@ class ScdHandlerService(BaseModuleService):
         return entry, []
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
-        entry, message = super().run_action(entry_id, action)
+        entry = store.find(self.MODULE, entry_id)
         if entry is None:
-            return None, message
+            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+        if action not in self.ACTION_RULES:
+            return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
 
         scd_type = entry.get("SCD类型", "")
         dim_code = entry.get("目标维度", "")
+        strategy_name = entry.get("策略名称", "")
 
-        if action == "启用策略":
-            # 执行SCD处理模拟
-            result = _simulate_scd_processing(entry)
-            store.channel.publish("scd.processing_result", {
-                "strategy_name": entry["策略名称"],
-                "dim_code": dim_code,
-                "scd_type": scd_type,
-                "result": result,
-                "entry_id": entry_id,
-            })
-
-            # 创建日志变更记录
-            _log_scd_activation(dim_code, scd_type, entry["策略名称"])
-
-        elif action == "停用策略":
+        if action == "停用策略":
+            entry["status"] = "已停用"
+            entry["pending"] = True
+            entry["abnormal"] = True
             store.channel.publish("scd.strategy_deactivated", {
-                "strategy_name": entry["策略名称"],
+                "strategy_name": strategy_name,
                 "dim_code": dim_code,
                 "entry_id": entry_id,
             })
+            record_processing(
+                strategy_id=entry_id, strategy_name=strategy_name, dim_code=dim_code,
+                action="停用策略", ok=True,
+            )
+            return entry, f"{self.ENTITY}已{action}"
 
-        return entry, message
+        # 启用策略：先尝试执行处理，成功后再生效状态。
+        effective_date = str(entry.get("生效时间") or "").strip()
+        if _parse_effective(effective_date) is None:
+            entry["abnormal"] = True
+            record_processing(
+                strategy_id=entry_id, strategy_name=strategy_name, dim_code=dim_code,
+                action="启用策略", ok=False, effective_date=effective_date,
+                error=f"生效时间 {effective_date or '(空)'} 不是有效的业务日期",
+            )
+            return None, f"生效时间 {effective_date or '(空)'} 不是有效的业务日期，策略未启用"
+
+        try:
+            result = _simulate_scd_processing(entry)
+            changes = _attribute_changes(entry, result, effective_date)
+            logs = record_dimension_changes(
+                dim_code=dim_code, changes=changes, effective_date=effective_date,
+                reason=f"SCD策略执行: {strategy_name}（{scd_type}）",
+            )
+            _track_attribute_values(dim_code, logs)
+        except Exception as exc:  # noqa: BLE001 - 处理失败要如实记入处理记录
+            entry["abnormal"] = True
+            record_processing(
+                strategy_id=entry_id, strategy_name=strategy_name, dim_code=dim_code,
+                action="启用策略", ok=False, effective_date=effective_date,
+                error=f"SCD处理失败: {exc}",
+            )
+            return None, f"SCD处理失败：{exc}"
+
+        # 处理成功后才落在策略状态上，失败时保持原状态并留下异常标记。
+        entry["status"] = "已启用"
+        entry["pending"] = False
+        entry["abnormal"] = False
+        store.channel.publish("scd.processing_result", {
+            "strategy_name": strategy_name,
+            "dim_code": dim_code,
+            "scd_type": scd_type,
+            "result": result,
+            "change_ids": [log["变更ID"] for log in logs],
+            "entry_id": entry_id,
+        })
+
+        record_processing(
+            strategy_id=entry_id, strategy_name=strategy_name, dim_code=dim_code,
+            action="启用策略", ok=True,
+            change_ids=[log["变更ID"] for log in logs],
+            applied_rows=len(logs), effective_date=effective_date,
+        )
+        return entry, f"{self.ENTITY}已{action}"
 
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
@@ -168,7 +215,7 @@ def _simulate_scd_processing(entry: dict[str, Any]) -> dict[str, Any]:
         return {
             "action": "overwrite", "algorithm": "scd1_direct_overwrite",
             "operation": f"直接更新{dim_code}表当前行，不保留历史",
-            "affected_fields": [f.strip() for f in detection_rule.replace("MD5(", "").replace(")", "").split(",") if f.strip()],
+            "affected_fields": _detection_fields(detection_rule),
             "rule_hash": rule_hash,
             "history_preserved": False,
             "new_rows_created": 0,
@@ -178,7 +225,7 @@ def _simulate_scd_processing(entry: dict[str, Any]) -> dict[str, Any]:
             "action": "insert_new_row",
             "algorithm": "scd2_versioning",
             "operation": f"为{dim_code}插入新版本行，设置旧行eff_end_dt=当前时间-1秒, is_current='N'",
-            "affected_fields": [f.strip() for f in detection_rule.replace("MD5(", "").replace(")", "").split(",") if f.strip()],
+            "affected_fields": _detection_fields(detection_rule),
             "rule_hash": rule_hash,
             "history_preserved": True,
             "new_rows_created": 1,
@@ -191,7 +238,7 @@ def _simulate_scd_processing(entry: dict[str, Any]) -> dict[str, Any]:
             "action": "update_with_history",
             "algorithm": "scd3_previous_value",
             "operation": f"更新{dim_code}表，将当前值移入prev_列，写入新值到当前列",
-            "affected_fields": [f.strip() for f in detection_rule.replace("MD5(", "").replace(")", "").split(",") if f.strip()],
+            "affected_fields": _detection_fields(detection_rule),
             "rule_hash": rule_hash,
             "history_preserved": True,
             "new_rows_created": 0,
@@ -209,19 +256,81 @@ def _simulate_scd_processing(entry: dict[str, Any]) -> dict[str, Any]:
         }
 
 
-def _log_scd_activation(dim_code: str, scd_type: str, strategy_name: str) -> None:
-    """记录SCD策略启用日志到slow_change_log。"""
-    log_entry = {
-        "id": len(store.rows("slow_change_log")) + 1,
-        "status": "已记录",
-        "pending": True,
-        "abnormal": False,
-        "变更ID": f"SCD_ACT_{dim_code}_{datetime.now(timezone.utc).strftime('%Y%m%d')}",
-        "目标维度": dim_code,
-        "变更字段": "SCD策略启用",
-        "旧值": "无",
-        "新值": strategy_name,
-        "变更时间": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "变更原因": f"SCD策略启用: {scd_type}",
-    }
-    store.insert("slow_change_log", log_entry)
+def _detection_fields(detection_rule: str) -> list[str]:
+    """从变化检测规则里提取受影响的属性字段。"""
+    cleaned = detection_rule.replace("MD5(", " ").replace(")", " ")
+    cleaned = cleaned.split("--")[0].replace("字段级比较:", " ")
+    return [field.strip() for field in cleaned.split(",") if field.strip()]
+
+
+def _parse_effective(value: str) -> str | None:
+    """校验策略生效时间；只接受可解析的业务日期。"""
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw[:10]).isoformat()
+    except ValueError:
+        return None
+
+
+def _current_attribute_value(dim_code: str, field: str) -> str:
+    """取属性当前值：优先取上次SCD写入值，其次取变更日志里最新的后值。"""
+    for row in reversed(store.rows("_dim_attr_value")):
+        if row.get("目标维度") == dim_code and row.get("变更字段") == field:
+            return str(row.get("当前值", ""))
+    latest = None
+    latest_key = ""
+    for row in store.rows("slow_change_log"):
+        if row.get("目标维度") != dim_code or field not in str(row.get("变更字段", "")):
+            continue
+        key = f"{row.get('生效日期') or ''}#{int(row.get('日志序号') or 0):08d}"
+        if key >= latest_key:
+            latest_key, latest = key, row
+    if latest is not None and latest.get("新值"):
+        return str(latest["新值"])
+    return "未记录"
+
+
+def _attribute_changes(
+    entry: dict[str, Any], result: dict[str, Any], effective_date: str,
+) -> list[dict[str, Any]]:
+    """把处理结果展开成一次变更下的逐属性前值/后值，供变更日志落库。"""
+    dim_code = entry.get("目标维度", "")
+    scd_type = entry.get("SCD类型", "")
+    fields = [str(field).strip() for field in result.get("affected_fields", []) if str(field).strip()]
+    if not fields:
+        # 没有可解析的属性字段时，至少记录策略本身的状态变化。
+        return [{
+            "变更字段": "SCD策略",
+            "前值": "草稿",
+            "后值": f"已启用@{effective_date}",
+        }]
+    version_tag = str(result.get("rule_hash", ""))[:6] or "处理完成"
+    changes = []
+    for field in fields:
+        old = _current_attribute_value(dim_code, field)
+        new = f"{field}@{scd_type}#{version_tag}"
+        changes.append({"变更字段": field, "前值": old, "后值": new})
+    return changes
+
+
+def _track_attribute_values(dim_code: str, logs: list[dict[str, Any]]) -> None:
+    """记录SCD写入后的属性当前值，作为下一次处理的前值来源。"""
+    table = store.rows("_dim_attr_value")
+    for log in logs:
+        field = str(log.get("变更字段", ""))
+        for row in table:
+            if row.get("目标维度") == dim_code and row.get("变更字段") == field:
+                row["当前值"] = log.get("新值")
+                row["生效日期"] = log.get("生效日期")
+                row["变更ID"] = log.get("变更ID")
+                break
+        else:
+            table.append({
+                "目标维度": dim_code,
+                "变更字段": field,
+                "当前值": log.get("新值"),
+                "生效日期": log.get("生效日期"),
+                "变更ID": log.get("变更ID"),
+            })
